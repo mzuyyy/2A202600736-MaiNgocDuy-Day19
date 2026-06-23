@@ -3,3 +3,7 @@
 dataset
 .env
 venv
+graph.graphml
+.pytest_cache
+.ruff_cache
+__pycache__
