@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import csv
+import time
 from collections.abc import Callable
 from pathlib import Path
+
+from langextract.core.exceptions import LangExtractError
 
 from graphrag.config import Settings
 from graphrag.documents import build_chunks, load_documents
 from graphrag.extraction import InvalidTripleResponseError, extract_chunk
 from graphrag.llm import LlmClient
+from graphrag.models import Chunk, Triple
 from graphrag.networkx_store import NetworkXStore
 
 TRIPLE_FIELDS = (
@@ -20,6 +24,7 @@ TRIPLE_FIELDS = (
     "source_chunk",
     "evidence",
 )
+MAX_EXTRACT_ATTEMPTS = 3
 
 
 def check_runtime(settings: Settings) -> tuple[int, str]:
@@ -58,8 +63,8 @@ def ingest(
         writer.writeheader()
         for index, chunk in enumerate(chunks, start=1):
             try:
-                triples = extract_chunk(settings.llm, chunk)
-            except InvalidTripleResponseError:
+                triples = extract_with_retries(settings, chunk)
+            except (ConnectionError, InvalidTripleResponseError, LangExtractError):
                 failed += 1
                 progress(f"[{index}/{len(chunks)}] invalid extraction: {chunk.chunk_id}")
                 continue
@@ -82,6 +87,22 @@ def ingest(
             )
     store.save()
     return stored, failed, settings.triples_path
+
+
+def extract_with_retries(
+    settings: Settings,
+    chunk: Chunk,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[Triple, ...]:
+    for attempt in range(1, MAX_EXTRACT_ATTEMPTS + 1):
+        try:
+            return extract_chunk(settings.llm, chunk)
+        except (ConnectionError, LangExtractError):
+            if attempt == MAX_EXTRACT_ATTEMPTS:
+                raise
+            sleep(float(2**attempt))
+    raise AssertionError("unreachable retry state")
 
 
 def answer(settings: Settings, question: str) -> str:

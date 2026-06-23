@@ -4,11 +4,12 @@ import pytest
 
 from graphrag.config import LlmSettings, Settings
 from graphrag.documents import chunk_text, load_documents
-from graphrag.app import ingest
+from graphrag.app import extract_with_retries, ingest
 from graphrag.extraction import extraction_to_triple
 from graphrag.models import Chunk, Triple
 from graphrag.networkx_store import NetworkXStore
 from graphrag_local import run
+from langextract.core.exceptions import InferenceRuntimeError
 from langextract import data as lx_data
 from pydantic import SecretStr
 
@@ -217,3 +218,37 @@ def test_ingest_rebuilds_graph_and_writes_langextract_csv(
     assert (stored, failed, written_path) == (1, 0, triples_path)
     assert [fact.source for fact in facts] == ["Tesla"]
     assert "Tesla,builds,EVs" in triples_path.read_text(encoding="utf-8")
+
+
+def test_extract_with_retries_recovers_from_transient_langextract_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given
+    settings = Settings(
+        llm=LlmSettings(
+            api_key=SecretStr("test-key"),
+            base_url="https://example.test/v1",
+        ),
+        dataset_dir=tmp_path,
+        graph_path=tmp_path / "graph.graphml",
+        triples_path=tmp_path / "triples.csv",
+    )
+    chunk = Chunk(chunk_id="doc_1.txt::ch0", doc_id="doc_1.txt", text="Tesla")
+    calls = 0
+
+    def flaky_extract(_settings: LlmSettings, _chunk: Chunk) -> tuple[Triple, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InferenceRuntimeError("connection reset")
+        return (Triple(subject="Tesla", relation="builds", object="EVs"),)
+
+    monkeypatch.setattr("graphrag.app.extract_chunk", flaky_extract)
+
+    # When
+    triples = extract_with_retries(settings, chunk, sleep=lambda _seconds: None)
+
+    # Then
+    assert triples == (Triple(subject="Tesla", relation="builds", object="EVs"),)
+    assert calls == 2
